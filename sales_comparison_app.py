@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import glob
 import os
 from datetime import datetime
 import pytz
@@ -10,100 +9,46 @@ st.set_page_config(page_title="Sales Comparison 2024 vs 2025", layout="wide")
 
 @st.cache_data
 def load_sales_data(year, cutoff_date=None):
-    """Load and parse all sales files for a given year - optimized with pandas"""
-    sales_dir = f"{year}_Sales"
+    """Load preprocessed sales data from CSV - much faster!"""
+    csv_file = f"cleaned_data/{year}_sales.csv"
 
-    if not os.path.exists(sales_dir):
-        st.error(f"Directory {sales_dir} not found!")
+    if not os.path.exists(csv_file):
+        st.error(f"Preprocessed data file not found: {csv_file}\n\nPlease run 'python preprocess_data.py' first!")
         return pd.DataFrame()
 
-    files = sorted(glob.glob(f"{sales_dir}/*.txt"))
-    all_dfs = []
-
-    for file_path in files:
-        try:
-            # Extract month from filename (e.g., "9-2024.txt" -> 9)
-            month = int(os.path.basename(file_path).split('-')[0])
-
-            # Use pandas to read the file - much faster
-            df = pd.read_csv(
-                file_path,
-                sep='\t',
-                encoding='utf-8',
-                encoding_errors='ignore',
-                usecols=['sku', 'asin', 'purchase-date', 'quantity'],
-                on_bad_lines='skip'
-            )
-
-            # Add month column
-            df['month'] = month
-
-            # Fill missing quantity with 1
-            df['quantity'] = df['quantity'].fillna(1).astype(int)
-
-            # Drop rows with missing sku or asin
-            df = df.dropna(subset=['sku', 'asin'])
-
-            # Rename for consistency
-            df = df.rename(columns={'purchase-date': 'purchase_date'})
-
-            all_dfs.append(df)
-
-        except Exception as e:
-            # Silently skip files that can't be processed
-            continue
-
-    if all_dfs:
-        combined_df = pd.concat(all_dfs, ignore_index=True)
+    try:
+        # Load preprocessed CSV (much faster than parsing multiple txt files)
+        df = pd.read_csv(csv_file)
 
         # Apply date filter if cutoff_date is provided
         if cutoff_date:
             # Parse purchase_date and filter
-            combined_df['purchase_datetime'] = pd.to_datetime(combined_df['purchase_date'], errors='coerce')
-            combined_df = combined_df[combined_df['purchase_datetime'] <= cutoff_date]
-            combined_df = combined_df.drop(columns=['purchase_datetime'])
-
-        return combined_df
-    else:
-        return pd.DataFrame()
-
-@st.cache_data
-def load_inventory_data():
-    """Load current inventory data from Inventory.txt"""
-    inventory_file = "Inventory.txt"
-
-    if not os.path.exists(inventory_file):
-        st.warning(f"Inventory file not found: {inventory_file}")
-        return pd.DataFrame()
-
-    try:
-        # Read inventory file
-        df = pd.read_csv(
-            inventory_file,
-            sep='\t',
-            encoding='utf-8',
-            encoding_errors='ignore',
-            usecols=['seller-sku', 'asin1', 'price', 'quantity'],
-            on_bad_lines='skip'
-        )
-
-        # Rename columns for consistency
-        df = df.rename(columns={
-            'seller-sku': 'sku',
-            'asin1': 'asin',
-            'price': 'current_price',
-            'quantity': 'current_inventory'
-        })
-
-        # Clean data
-        df = df.dropna(subset=['sku', 'asin'])
-        df['current_price'] = pd.to_numeric(df['current_price'], errors='coerce').fillna(0)
-        df['current_inventory'] = pd.to_numeric(df['current_inventory'], errors='coerce').fillna(0).astype(int)
+            df['purchase_datetime'] = pd.to_datetime(df['purchase_date'], errors='coerce')
+            df = df[df['purchase_datetime'] <= cutoff_date]
+            df = df.drop(columns=['purchase_datetime'])
 
         return df
 
     except Exception as e:
-        st.warning(f"Error loading inventory file: {e}")
+        st.error(f"Error loading preprocessed data: {e}")
+        return pd.DataFrame()
+
+@st.cache_data
+def load_inventory_data():
+    """Load preprocessed inventory data from CSV"""
+    csv_file = "cleaned_data/inventory.csv"
+
+    if not os.path.exists(csv_file):
+        st.warning(f"Preprocessed inventory file not found: {csv_file}\n\nPlease run 'python preprocess_data.py' first!")
+        return pd.DataFrame()
+
+    try:
+        # Load preprocessed CSV (already cleaned and formatted)
+        df = pd.read_csv(csv_file)
+        return df
+
+    except Exception as e:
+        st.warning(f"Error loading preprocessed inventory: {e}")
         return pd.DataFrame()
 
 @st.cache_data
@@ -292,17 +237,20 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
+    st.info("📝 **Note:** This app uses preprocessed data.\n\nIf you've updated the source files, run:\n```python preprocess_data.py```")
+
+    st.divider()
     st.caption(f"**Comparing:**")
     st.caption(f"2024: Jan 1 - {cutoff_2024.strftime('%b %d, %Y')}")
     st.caption(f"2025: Jan 1 - {cutoff_2025.strftime('%b %d, %Y')}")
 
 # Load data with single spinner
-with st.spinner("Loading sales data..."):
+with st.spinner("Loading preprocessed data..."):
     df_2024 = load_sales_data('2024', cutoff_2024)
     df_2025 = load_sales_data('2025', cutoff_2025)
 
 if df_2024.empty and df_2025.empty:
-    st.error("No sales data found in either 2024_Sales or 2025_Sales directories!")
+    st.error("No sales data found! Please run 'python preprocess_data.py' to generate preprocessed data files.")
     st.stop()
 
 # Load inventory data
