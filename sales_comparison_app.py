@@ -9,23 +9,20 @@ st.set_page_config(page_title="Sales Comparison 2024 vs 2025", layout="wide")
 
 @st.cache_data
 def load_sales_data(year, cutoff_date=None):
-    """Load preprocessed sales data from CSV - much faster!"""
-    csv_file = f"cleaned_data/{year}_sales.csv"
+    """Load preprocessed sales data from Parquet - lightning fast!"""
+    parquet_file = f"cleaned_data/{year}_sales.parquet"
 
-    if not os.path.exists(csv_file):
-        st.error(f"Preprocessed data file not found: {csv_file}\n\nPlease run 'python preprocess_data.py' first!")
+    if not os.path.exists(parquet_file):
+        st.error(f"Preprocessed data file not found: {parquet_file}\n\nPlease run 'python preprocess_data.py' first!")
         return pd.DataFrame()
 
     try:
-        # Load preprocessed CSV (much faster than parsing multiple txt files)
-        df = pd.read_csv(csv_file)
+        # Load preprocessed Parquet (much faster than CSV!)
+        df = pd.read_parquet(parquet_file)
 
-        # Apply date filter if cutoff_date is provided
+        # Apply date filter if cutoff_date is provided (dates are already parsed)
         if cutoff_date:
-            # Parse purchase_date and filter
-            df['purchase_datetime'] = pd.to_datetime(df['purchase_date'], errors='coerce')
-            df = df[df['purchase_datetime'] <= cutoff_date]
-            df = df.drop(columns=['purchase_datetime'])
+            df = df[df['purchase_date'] <= cutoff_date]
 
         return df
 
@@ -35,16 +32,16 @@ def load_sales_data(year, cutoff_date=None):
 
 @st.cache_data
 def load_inventory_data():
-    """Load preprocessed inventory data from CSV"""
-    csv_file = "cleaned_data/inventory.csv"
+    """Load preprocessed inventory data from Parquet"""
+    parquet_file = "cleaned_data/inventory.parquet"
 
-    if not os.path.exists(csv_file):
-        st.warning(f"Preprocessed inventory file not found: {csv_file}\n\nPlease run 'python preprocess_data.py' first!")
+    if not os.path.exists(parquet_file):
+        st.warning(f"Preprocessed inventory file not found: {parquet_file}\n\nPlease run 'python preprocess_data.py' first!")
         return pd.DataFrame()
 
     try:
-        # Load preprocessed CSV (already cleaned and formatted)
-        df = pd.read_csv(csv_file)
+        # Load preprocessed Parquet (already cleaned and optimized)
+        df = pd.read_parquet(parquet_file)
         return df
 
     except Exception as e:
@@ -52,12 +49,18 @@ def load_inventory_data():
         return pd.DataFrame()
 
 @st.cache_data
-def create_sku_level_data(year_2024_data, year_2025_data, inventory_data):
-    """Pre-compute SKU-level aggregations for fast searching"""
+def create_sku_level_data(df_2024, df_2025, inventory_df):
+    """Pre-compute SKU-level aggregations for fast searching - works directly with DataFrames"""
 
-    df_2024 = pd.DataFrame(year_2024_data)
-    df_2025 = pd.DataFrame(year_2025_data)
-    inventory_df = pd.DataFrame(inventory_data)
+    # Calculate past 7 days date range (timezone-aware to match data)
+    from datetime import datetime, timedelta
+    import pytz
+    utc = pytz.UTC
+    today = datetime.now(utc)
+    seven_days_ago = today - timedelta(days=7)
+
+    # Filter 2025 data for past 7 days
+    df_2025_past7 = df_2025[df_2025['purchase_date'] >= seven_days_ago]
 
     # Aggregate by SKU for 2024
     sku_totals_2024 = df_2024.groupby('sku').agg({
@@ -79,6 +82,10 @@ def create_sku_level_data(year_2024_data, year_2025_data, inventory_data):
     }).reset_index()
     sku_totals_2025.columns = ['sku', 'total_2025', 'asin_2025']
 
+    # Aggregate past 7 days by SKU
+    sku_past7 = df_2025_past7.groupby('sku')['quantity'].sum().reset_index()
+    sku_past7.columns = ['sku', 'past_7_days']
+
     # Monthly data for 2025
     monthly_2025 = df_2025.groupby(['sku', 'month'])['quantity'].sum().reset_index()
     monthly_2025_dict = monthly_2025.groupby('sku').apply(
@@ -87,10 +94,12 @@ def create_sku_level_data(year_2024_data, year_2025_data, inventory_data):
 
     # Merge
     sku_data = pd.merge(sku_totals_2024, sku_totals_2025[['sku', 'total_2025']], on='sku', how='outer')
+    sku_data = pd.merge(sku_data, sku_past7, on='sku', how='left')
 
     # Fill NaN values
     sku_data['total_2024'] = sku_data['total_2024'].fillna(0).astype(int)
     sku_data['total_2025'] = sku_data['total_2025'].fillna(0).astype(int)
+    sku_data['past_7_days'] = sku_data['past_7_days'].fillna(0).astype(int)
 
     # Fill ASIN from either year
     if not df_2025.empty:
@@ -99,12 +108,11 @@ def create_sku_level_data(year_2024_data, year_2025_data, inventory_data):
 
     sku_data['asin'] = sku_data['asin'].fillna('N/A')
 
-    # Calculate metrics
+    # Calculate metrics (vectorized for better performance)
     sku_data['difference'] = sku_data['total_2025'] - sku_data['total_2024']
-    sku_data['change_pct'] = sku_data.apply(
-        lambda row: round((row['difference'] / row['total_2024'] * 100), 1) if row['total_2024'] > 0 else 0,
-        axis=1
-    )
+    sku_data['change_pct'] = 0.0
+    mask = sku_data['total_2024'] > 0
+    sku_data.loc[mask, 'change_pct'] = ((sku_data.loc[mask, 'difference'] / sku_data.loc[mask, 'total_2024']) * 100).round(1)
 
     # Add monthly data
     sku_data['monthly_2024'] = sku_data['sku'].map(monthly_2024_dict).apply(lambda x: x if isinstance(x, dict) else {})
@@ -125,12 +133,18 @@ def create_sku_level_data(year_2024_data, year_2025_data, inventory_data):
     return sku_data
 
 @st.cache_data
-def create_comparison_table(year_2024_data, year_2025_data, inventory_data):
-    """Create a comprehensive comparison table - optimized version"""
+def create_comparison_table(df_2024, df_2025, inventory_df):
+    """Create a comprehensive comparison table - works directly with DataFrames for maximum performance"""
 
-    df_2024 = pd.DataFrame(year_2024_data)
-    df_2025 = pd.DataFrame(year_2025_data)
-    inventory_df = pd.DataFrame(inventory_data)
+    # Calculate past 7 days date range (timezone-aware to match data)
+    from datetime import datetime, timedelta
+    import pytz
+    utc = pytz.UTC
+    today = datetime.now(utc)
+    seven_days_ago = today - timedelta(days=7)
+
+    # Filter 2025 data for past 7 days
+    df_2025_past7 = df_2025[df_2025['purchase_date'] >= seven_days_ago]
 
     # Pre-aggregate all data at once for better performance
     agg_2024 = df_2024.groupby('asin').agg({
@@ -145,6 +159,10 @@ def create_comparison_table(year_2024_data, year_2025_data, inventory_data):
     }).reset_index()
     agg_2025.columns = ['asin', 'total_2025', 'skus_2025']
 
+    # Aggregate past 7 days
+    agg_past7 = df_2025_past7.groupby('asin')['quantity'].sum().reset_index()
+    agg_past7.columns = ['asin', 'past_7_days']
+
     # Get monthly aggregations
     monthly_2024 = df_2024.groupby(['asin', 'month'])['quantity'].sum().reset_index()
     monthly_2024_dict = monthly_2024.groupby('asin').apply(
@@ -156,12 +174,14 @@ def create_comparison_table(year_2024_data, year_2025_data, inventory_data):
         lambda x: dict(zip(x['month'], x['quantity']))
     ).to_dict()
 
-    # Merge the aggregations
+    # Merge the aggregations including past 7 days
     comparison = pd.merge(agg_2024, agg_2025, on='asin', how='outer')
+    comparison = pd.merge(comparison, agg_past7, on='asin', how='left')
 
     # Fill NaN values
     comparison['total_2024'] = comparison['total_2024'].fillna(0).astype(int)
     comparison['total_2025'] = comparison['total_2025'].fillna(0).astype(int)
+    comparison['past_7_days'] = comparison['past_7_days'].fillna(0).astype(int)
     comparison['skus_2024'] = comparison['skus_2024'].apply(lambda x: x if isinstance(x, list) else [])
     comparison['skus_2025'] = comparison['skus_2025'].apply(lambda x: x if isinstance(x, list) else [])
 
@@ -171,12 +191,11 @@ def create_comparison_table(year_2024_data, year_2025_data, inventory_data):
         axis=1
     )
 
-    # Calculate differences and changes
+    # Calculate differences and changes (vectorized for better performance)
     comparison['difference'] = comparison['total_2025'] - comparison['total_2024']
-    comparison['change_pct'] = comparison.apply(
-        lambda row: round((row['difference'] / row['total_2024'] * 100), 1) if row['total_2024'] > 0 else 0,
-        axis=1
-    )
+    comparison['change_pct'] = 0.0
+    mask = comparison['total_2024'] > 0
+    comparison.loc[mask, 'change_pct'] = ((comparison.loc[mask, 'difference'] / comparison.loc[mask, 'total_2024']) * 100).round(1)
 
     # Add monthly data
     comparison['monthly_2024'] = comparison['asin'].map(monthly_2024_dict).apply(lambda x: x if isinstance(x, dict) else {})
@@ -190,6 +209,7 @@ def create_comparison_table(year_2024_data, year_2025_data, inventory_data):
         'Total 2025': comparison['total_2025'],
         'Difference': comparison['difference'],
         'Change %': comparison['change_pct'],
+        'Past 7 Days': comparison['past_7_days'],
         'monthly_2024': comparison['monthly_2024'],
         'monthly_2025': comparison['monthly_2025']
     })
@@ -257,44 +277,19 @@ if df_2024.empty and df_2025.empty:
 inventory_df = load_inventory_data()
 
 # Create comparison tables (cached for performance - includes inventory merging)
+# Pass DataFrames directly for maximum performance - no dict conversions!
 with st.spinner("Analyzing data..."):
     comparison_df = create_comparison_table(
-        df_2024.to_dict('records'),
-        df_2025.to_dict('records'),
-        inventory_df.to_dict('records') if not inventory_df.empty else []
+        df_2024,
+        df_2025,
+        inventory_df if not inventory_df.empty else pd.DataFrame()
     )
     # Pre-compute SKU-level data for fast searching (includes inventory merging)
     sku_level_df = create_sku_level_data(
-        df_2024.to_dict('records'),
-        df_2025.to_dict('records'),
-        inventory_df.to_dict('records') if not inventory_df.empty else []
+        df_2024,
+        df_2025,
+        inventory_df if not inventory_df.empty else pd.DataFrame()
     )
-
-# Summary statistics
-st.header("📈 Year-to-Date Summary")
-
-if not inventory_df.empty:
-    col1, col2, col3, col4 = st.columns(4)
-else:
-    col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.metric("Total Units 2024 (YTD)", f"{df_2024['quantity'].sum():,}")
-    st.metric("Unique ASINs 2024", len(df_2024['asin'].unique()))
-
-with col2:
-    st.metric("Total Units 2025 (YTD)", f"{df_2025['quantity'].sum():,}")
-    st.metric("Unique ASINs 2025", len(df_2025['asin'].unique()))
-
-with col3:
-    year_diff = df_2025['quantity'].sum() - df_2024['quantity'].sum()
-    year_pct = (year_diff / df_2024['quantity'].sum() * 100) if df_2024['quantity'].sum() > 0 else 0
-    st.metric("YoY Change (Units)", f"{year_diff:+,}", f"{year_pct:+.1f}%")
-
-if not inventory_df.empty:
-    with col4:
-        st.metric("Current Inventory", f"{inventory_df['current_inventory'].sum():,}")
-        st.metric("Total SKUs in Stock", len(inventory_df[inventory_df['current_inventory'] > 0]))
 
 # Filters
 st.header("🔍 Filter Options")
@@ -347,7 +342,7 @@ if 'current_inventory' in filtered_df.columns:
 
 # Create display dataframe
 if 'current_inventory' in filtered_df.columns:
-    display_df = filtered_df[['ASIN', 'SKUs', 'Total 2024', 'Total 2025', 'Difference', 'Change %', 'current_inventory', 'current_price']].copy()
+    display_df = filtered_df[['ASIN', 'SKUs', 'Total 2024', 'Total 2025', 'Difference', 'Change %', 'Past 7 Days', 'current_inventory', 'current_price']].copy()
     display_df = display_df.rename(columns={
         'Total 2024': '2024 (YTD)',
         'Total 2025': '2025 (YTD)',
@@ -355,8 +350,11 @@ if 'current_inventory' in filtered_df.columns:
         'current_price': 'Avg Price'
     })
 else:
-    display_df = filtered_df[['ASIN', 'SKUs', 'Total 2024', 'Total 2025', 'Difference', 'Change %']].copy()
-    display_df.columns = ['ASIN', 'SKUs', '2024 (YTD)', '2025 (YTD)', 'Difference', 'Change %']
+    display_df = filtered_df[['ASIN', 'SKUs', 'Total 2024', 'Total 2025', 'Difference', 'Change %', 'Past 7 Days']].copy()
+    display_df.columns = ['ASIN', 'SKUs', '2024 (YTD)', '2025 (YTD)', 'Difference', 'Change %', 'Past 7 Days']
+
+# Convert ASIN to clickable Amazon product links
+display_df['ASIN'] = display_df['ASIN'].apply(lambda x: f"https://www.amazon.com/dp/{x}")
 
 # Color code the dataframe with better contrast
 def highlight_change(row):
@@ -373,7 +371,8 @@ format_dict = {
     '2024 (YTD)': '{:,}',
     '2025 (YTD)': '{:,}',
     'Difference': '{:+,}',
-    'Change %': '{:+.1f}%'
+    'Change %': '{:+.1f}%',
+    'Past 7 Days': '{:,}'
 }
 
 if 'Current Qty' in display_df.columns:
@@ -383,7 +382,13 @@ if 'Current Qty' in display_df.columns:
 st.dataframe(
     display_df.style.apply(highlight_change, axis=1).format(format_dict),
     use_container_width=True,
-    height=600
+    height=600,
+    column_config={
+        "ASIN": st.column_config.LinkColumn(
+            "ASIN",
+            display_text="https://www\.amazon\.com/dp/(.*)"
+        )
+    }
 )
 
 # SKU Search Feature
@@ -411,7 +416,8 @@ if sku_search:
             'total_2024': '2024 (YTD)',
             'total_2025': '2025 (YTD)',
             'difference': 'Difference',
-            'change_pct': 'Change %'
+            'change_pct': 'Change %',
+            'past_7_days': 'Past 7 Days'
         })
 
         # Display summary table
@@ -422,13 +428,13 @@ if sku_search:
 
         # Select columns based on what's available
         if 'current_inventory' in sku_comparison_df.columns:
-            display_sku_df = sku_comparison_df[['SKU', 'ASIN', '2024 (YTD)', '2025 (YTD)', 'Difference', 'Change %', 'current_inventory', 'current_price']].copy()
+            display_sku_df = sku_comparison_df[['SKU', 'ASIN', '2024 (YTD)', '2025 (YTD)', 'Difference', 'Change %', 'Past 7 Days', 'current_inventory', 'current_price']].copy()
             display_sku_df = display_sku_df.rename(columns={
                 'current_inventory': 'Current Qty',
                 'current_price': 'Price'
             })
         else:
-            display_sku_df = sku_comparison_df[['SKU', 'ASIN', '2024 (YTD)', '2025 (YTD)', 'Difference', 'Change %']].copy()
+            display_sku_df = sku_comparison_df[['SKU', 'ASIN', '2024 (YTD)', '2025 (YTD)', 'Difference', 'Change %', 'Past 7 Days']].copy()
 
         # Add totals row
         totals = {
@@ -437,7 +443,8 @@ if sku_search:
             '2024 (YTD)': display_sku_df['2024 (YTD)'].sum(),
             '2025 (YTD)': display_sku_df['2025 (YTD)'].sum(),
             'Difference': display_sku_df['Difference'].sum(),
-            'Change %': ((display_sku_df['2025 (YTD)'].sum() - display_sku_df['2024 (YTD)'].sum()) / display_sku_df['2024 (YTD)'].sum() * 100) if display_sku_df['2024 (YTD)'].sum() > 0 else 0
+            'Change %': ((display_sku_df['2025 (YTD)'].sum() - display_sku_df['2024 (YTD)'].sum()) / display_sku_df['2024 (YTD)'].sum() * 100) if display_sku_df['2024 (YTD)'].sum() > 0 else 0,
+            'Past 7 Days': display_sku_df['Past 7 Days'].sum()
         }
 
         if 'Current Qty' in display_sku_df.columns:
@@ -453,12 +460,19 @@ if sku_search:
         if 'Price' in display_with_totals.columns:
             display_with_totals.loc[display_with_totals['SKU'] == 'TOTAL (All Sizes)', 'Price'] = None
 
+        # Convert ASIN to clickable Amazon product links (except for totals row)
+        display_with_totals.loc[display_with_totals['SKU'] != 'TOTAL (All Sizes)', 'ASIN'] = \
+            display_with_totals.loc[display_with_totals['SKU'] != 'TOTAL (All Sizes)', 'ASIN'].apply(
+                lambda x: f"https://www.amazon.com/dp/{x}" if pd.notna(x) and x != '' else x
+            )
+
         # Format dictionary
         sku_format_dict = {
             '2024 (YTD)': '{:,.0f}',
             '2025 (YTD)': '{:,.0f}',
             'Difference': '{:+,.0f}',
-            'Change %': '{:+.1f}%'
+            'Change %': '{:+.1f}%',
+            'Past 7 Days': '{:,.0f}'
         }
 
         if 'Current Qty' in display_with_totals.columns:
@@ -467,7 +481,13 @@ if sku_search:
 
         st.dataframe(
             display_with_totals.style.format(sku_format_dict, na_rep='-'),
-            use_container_width=True
+            use_container_width=True,
+            column_config={
+                "ASIN": st.column_config.LinkColumn(
+                    "ASIN",
+                    display_text="https://www\.amazon\.com/dp/(.*)"
+                )
+            }
         )
 
         # Monthly breakdown for selected SKU from search results
